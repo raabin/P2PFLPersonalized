@@ -29,7 +29,7 @@ from typing import Dict, Any, Tuple, List
 
 shutdown_event = threading.Event()
 
-from mnist_bert_fl_ml_modules import SimpleCNN, ModernBERTClassifier, get_mnist_data_loaders, get_mnist_data_loaders_dirichlet, get_text_data_loaders, get_text_data_loaders_dirichlet, train_num_mini_batches_manually, evaluate, knowledge_distillation, set_all_seeds
+from mnist_bert_fl_ml_modules import SimpleCNN, ModernBERTClassifier, get_mnist_data_loaders, get_mnist_data_loaders_dirichlet, get_text_data_loaders, get_text_data_loaders_dirichlet, train_num_mini_batches_manually, evaluate, set_all_seeds
 
 
 
@@ -37,8 +37,6 @@ from mnist_bert_fl_ml_modules import SimpleCNN, ModernBERTClassifier, get_mnist_
 
 ML_TASK = "mnist"
 
-KNOWLEDGE_DISTILLATION = False
-KNOWLEDGE_DISTILLATION_NO_BLENDING = False
 KD_NUM_DATASET_SIGHTINGS = 10                                               # NOTE usually use value 10; how often each peer sees his entire training dataloader's batches while using KD
 
 TESTING = False
@@ -526,14 +524,11 @@ signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 # Generate a unique and informative wandb run name
-def generate_unique_run_name(split_type, entity, project, seed, ml_task, num_peers, mini_batches_per_iteration, aggregation_participation_prob, local_update_participation_prob, peer_dropout_likelihood, do_kd, kd_iters):
+def generate_unique_run_name(split_type, entity, project, seed, ml_task, num_peers, mini_batches_per_iteration, aggregation_participation_prob, local_update_participation_prob, peer_dropout_likelihood):
     api = wandb.Api()
-    if do_kd:
-        base_name = f"ar{num_peers}{ml_task}-k{kd_iters}_b{mini_batches_per_iteration}_a{aggregation_participation_prob}_d{peer_dropout_likelihood}__s{seed}"
-    else:
-        base_name = f"ar{num_peers}{ml_task}_b{mini_batches_per_iteration}_a{aggregation_participation_prob}_d{peer_dropout_likelihood}__s{seed}"
-        if local_update_participation_prob < 100:
-            base_name = f"ar{num_peers}{ml_task}_b{mini_batches_per_iteration}_u{local_update_participation_prob}_a{aggregation_participation_prob}_d{peer_dropout_likelihood}__s{seed}"
+    base_name = f"ar{num_peers}{ml_task}_b{mini_batches_per_iteration}_a{aggregation_participation_prob}_d{peer_dropout_likelihood}__s{seed}"
+    if local_update_participation_prob < 100:
+        base_name = f"ar{num_peers}{ml_task}_b{mini_batches_per_iteration}_u{local_update_participation_prob}_a{aggregation_participation_prob}_d{peer_dropout_likelihood}__s{seed}"
     if split_type == "dirichlet":
         base_name += "_niid"
     existing_runs = api.runs(f"{entity}/{project}", filters={"display_name": {"$regex": f"^{base_name}(_\\d+)?$"}})
@@ -587,7 +582,7 @@ def count_num_participating_peers(peer_id, iteration, num_peers, dht, wait_time=
     return len(participating_peers), sorted(participating_peers)
 
 # Communicate model parameters and momentum vectors within groups through writing to and reading from shared group dicts
-def communicate_models(testing, device, peer_id, num_peers, num_participating_peers, model, momentum_vector, shared_model_dict, dht, iteration, round, kn_dist_iters, communicated_bytes,
+def communicate_models(testing, device, peer_id, num_peers, num_participating_peers, model, momentum_vector, shared_model_dict, dht, iteration, round, communicated_bytes,
                        validation_loader=None, validator=None, ledger=None, enable_validation=False):
     
     # Prepare data to be communicated
@@ -600,137 +595,67 @@ def communicate_models(testing, device, peer_id, num_peers, num_participating_pe
         momentum_to_send = [mv.cpu().clone() for mv in momentum_vector]
 
     # Store model & momentum vector in group dict and inform other peers via dht and wait for all participating peers to write
-    if kn_dist_iters > 0 and iteration < kn_dist_iters and round == 1:
-        shared_model_dict[(iter_key, peer_id)] = {"model_state_dict": state_dict_to_send}
-    else:
-        shared_model_dict[(iter_key, peer_id)] = {"model_state_dict": state_dict_to_send, "momentum_vector": momentum_to_send}
+
+    shared_model_dict[(iter_key, peer_id)] = {"model_state_dict": state_dict_to_send, "momentum_vector": momentum_to_send}
     barrier_key = f"cm1_{iter_key}"
     dht.store(f"{barrier_key}_{peer_id}", True, expiration_time=hivemind.get_dht_time() + 60)
     if testing:
         print(f"Peer {peer_id} cm1 in iteration {iteration}-{round}.", flush=True)
     written_members = wait_for_all(dht, barrier_key, num_peers, num_participating_peers)
 
-    # Memory-intensive collection in KD round
-    if kn_dist_iters > 0 and iteration < kn_dist_iters and round == 1:
-        models_collected = []
-
-        # 1v2: collect models from other peers
-        for peer in written_members:
-            if peer == peer_id: continue # NOTE teachers are other peers
-            try:
-                entry = shared_model_dict[(iter_key, peer)]
-                incoming_state = entry["model_state_dict"]
-                incoming_momentum = entry["momentum_vector"]
-                
-                ## Added Validation Logic ##
-                should_integrate = True  # Default behavior
-                
-                if enable_validation and validator is not None and validation_loader is not None:
-                    # Move to GPU for validation
-                    incoming_state_gpu = {k: v.to(device) for k, v in incoming_state.items()}
-                    
-                    # Validate
-                    result = validator.validate(
-                        peer_model=model,
-                        incoming_state_dict=incoming_state_gpu,
-                        device=device,
-                        validation_loader=validation_loader,
-                        peer_id=peer_id
-                    )
-                    
-                    should_integrate = result['valid']
-                    print(result['decision_reason'], flush=True)
-                    
-                    # Update ledger
-                    if ledger is not None:
-                        if should_integrate:
-                            ledger.add_integration(iteration, peer, result)
-                        else:
-                            ledger.add_rejection(iteration, peer, result)
-                    
-                    del incoming_state_gpu
-                    if should_integrate:
-                        models_collected.append({k: v.to(device) for k, v in entry["model_state_dict"].items()})
-                        incoming_state_gpu = {k: v.to(device) for k, v in incoming_state.items()}
-                        incoming_momentum_gpu = [m.to(device) for m in incoming_momentum]
-                        
-                        for key in sum_state_dict:
-                            if key in incoming_state_gpu:
-                                sum_state_dict[key].add_(incoming_state_gpu[key])
-                        
-                        for i in range(len(sum_momentum_vector)):
-                            sum_momentum_vector[i].add_(incoming_momentum_gpu[i])
-                        
-                        model_count += 1
-                        del incoming_state_gpu, incoming_momentum_gpu
-            except KeyError:
-                print(f"[{datetime.now()}] WARNING: Peer {peer_id} could not load model from peer {peer}.")
-        
-        # 2v2: track communication trafic
-        collected_teacher_bytes = sum(
-            sum(p.numel() * p.element_size() for p in peer_model.values())
-            for peer_model in models_collected
-        )
-        communicated_bytes += collected_teacher_bytes
-        return models_collected, None, len(written_members), communicated_bytes
-    
-    # Memory-efficient streaming aggregation in FedAvg round
+    # 1v5: initialize sum with own model/momentum
+    if isinstance(model, ModernBERTClassifier):
+        sum_state_dict = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
+        sum_momentum_vector = [mv.clone() for p, mv in zip(model.parameters(), momentum_vector) if p.requires_grad]
     else:
+        sum_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+        sum_momentum_vector = [mv.clone() for mv in momentum_vector]
+    model_count = 1
 
-        # 1v5: initialize sum with own model/momentum
-        if isinstance(model, ModernBERTClassifier):
-            sum_state_dict = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
-            sum_momentum_vector = [mv.clone() for p, mv in zip(model.parameters(), momentum_vector) if p.requires_grad]
-        else:
-            sum_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
-            sum_momentum_vector = [mv.clone() for mv in momentum_vector]
-        model_count = 1
-
-        # 2v5: stream, sum and discard models from other peers
-        for peer in written_members:
-            if peer == peer_id: continue
-            try:
-                entry = shared_model_dict[(iter_key, peer)]
-                incoming_model_gpu = {k: v.to(device) for k, v in entry["model_state_dict"].items()}
-                incoming_momentum_gpu = [m.to(device) for m in entry["momentum_vector"]]
-                for key in sum_state_dict:
-                    if key in incoming_model_gpu:
-                        sum_state_dict[key].add_(incoming_model_gpu[key])
-                for i in range(len(sum_momentum_vector)):
-                    sum_momentum_vector[i].add_(incoming_momentum_gpu[i])
-                model_count += 1
-                del incoming_model_gpu, incoming_momentum_gpu
-            except KeyError:
-                print(f"[{datetime.now()}] WARNING: Peer {peer_id} could not load model/momentum from peer {peer}.")
-
-        # 3v5: finalize the average
-        if model_count > 0:
+    # 2v5: stream, sum and discard models from other peers
+    for peer in written_members:
+        if peer == peer_id: continue
+        try:
+            entry = shared_model_dict[(iter_key, peer)]
+            incoming_model_gpu = {k: v.to(device) for k, v in entry["model_state_dict"].items()}
+            incoming_momentum_gpu = [m.to(device) for m in entry["momentum_vector"]]
             for key in sum_state_dict:
-                sum_state_dict[key].div_(model_count)
+                if key in incoming_model_gpu:
+                    sum_state_dict[key].add_(incoming_model_gpu[key])
             for i in range(len(sum_momentum_vector)):
-                sum_momentum_vector[i].div_(model_count)
-        
-        # 4v5: track communication traffic
-        communicated_bytes += (sum(p.numel() * p.element_size() for p in sum_state_dict.values()) + sum(m.numel() * m.element_size() for m in sum_momentum_vector)) * (model_count -1)
+                sum_momentum_vector[i].add_(incoming_momentum_gpu[i])
+            model_count += 1
+            del incoming_model_gpu, incoming_momentum_gpu
+        except KeyError:
+            print(f"[{datetime.now()}] WARNING: Peer {peer_id} could not load model/momentum from peer {peer}.")
 
-        # 5v5: cleanup if we are the coordinator
-        barrier_key_cleanup = f"cm2_{iter_key}"
-        dht.store(f"{barrier_key_cleanup}_{peer_id}", True, expiration_time=hivemind.get_dht_time() + 60)
-        if peer_id == min(written_members): # Coordinator cleans up the shared dict
-            wait_for_peers(dht, barrier_key_cleanup, written_members)
-            for peer in written_members:
-                try:
-                    if (iter_key, peer) in shared_model_dict:
-                        del shared_model_dict[(iter_key, peer)]
-                except KeyError:
-                    pass
-            torch.cuda.empty_cache()
-            gc.collect()        
-        return sum_state_dict, sum_momentum_vector, len(written_members), communicated_bytes
+    # 3v5: finalize the average
+    if model_count > 0:
+        for key in sum_state_dict:
+            sum_state_dict[key].div_(model_count)
+        for i in range(len(sum_momentum_vector)):
+            sum_momentum_vector[i].div_(model_count)
+    
+    # 4v5: track communication traffic
+    communicated_bytes += (sum(p.numel() * p.element_size() for p in sum_state_dict.values()) + sum(m.numel() * m.element_size() for m in sum_momentum_vector)) * (model_count -1)
+
+    # 5v5: cleanup if we are the coordinator
+    barrier_key_cleanup = f"cm2_{iter_key}"
+    dht.store(f"{barrier_key_cleanup}_{peer_id}", True, expiration_time=hivemind.get_dht_time() + 60)
+    if peer_id == min(written_members): # Coordinator cleans up the shared dict
+        wait_for_peers(dht, barrier_key_cleanup, written_members)
+        for peer in written_members:
+            try:
+                if (iter_key, peer) in shared_model_dict:
+                    del shared_model_dict[(iter_key, peer)]
+            except KeyError:
+                pass
+        torch.cuda.empty_cache()
+        gc.collect()        
+    return sum_state_dict, sum_momentum_vector, len(written_members), communicated_bytes
 
 
-
-def peer_process(seed, split_type, dirichlet_alpha, ml_task, peer_id, bootstrap_address, task_queue, result_queue, num_peers, peers_per_core, learning_rate, momentum, shared_model_dict, valid_cores, device, kn_dist, kn_dist_iters, kn_dist_no_blending, model, momentum_vector=None, next_batch_idx=None
+def peer_process(seed, split_type, dirichlet_alpha, ml_task, peer_id, bootstrap_address, task_queue, result_queue, num_peers, peers_per_core, learning_rate, momentum, shared_model_dict, valid_cores, device, model, momentum_vector=None, next_batch_idx=None
                  , enable_validation=False, accuracy_threshold=0.2):
     try:
         """ Each peer runs persistently and waits for tasks to execute """
@@ -749,7 +674,7 @@ def peer_process(seed, split_type, dirichlet_alpha, ml_task, peer_id, bootstrap_
         # Testing logs for debugging
         if TESTING:
             log_group_id = (peer_id // 10) * 10
-            log_path = f"ar{num_peers}-{ml_task}-{kn_dist}-testing_peers{log_group_id}-{log_group_id+9}.log"
+            log_path = f"ar{num_peers}-{ml_task}-testing_peers{log_group_id}-{log_group_id+9}.log"
             sys.stdout = open(log_path, "a", buffering=1)
             sys.stderr = sys.stdout
 
@@ -761,8 +686,9 @@ def peer_process(seed, split_type, dirichlet_alpha, ml_task, peer_id, bootstrap_
             device = torch.device("cuda")
         else:
             device = torch.device("cpu")
-        model = model.to(device)
-        if ml_task == "news":
+        model = model.to(device) # We will need to have different models per peer process, So maybe we should pass in
+                                 #  different models per peer process from the main process
+        if ml_task == "news": # That leaves with having to load different datasets per peer process
             if split_type == "dirichlet":
                 train_loader, validation_loader, test_loader = get_text_data_loaders_dirichlet(partition=peer_id, num_partitions=num_peers, seed=seed, alpha=dirichlet_alpha)
             else:
@@ -773,13 +699,13 @@ def peer_process(seed, split_type, dirichlet_alpha, ml_task, peer_id, bootstrap_
             else:
                 train_loader, validation_loader, test_loader = get_mnist_data_loaders(partition=peer_id, num_partitions=num_peers, seed=seed)
 
-        
+        # Added things for ModelChain validation
         if enable_validation:
             validator, ledger = create_validation_components(
                 peer_id=peer_id,
                 accuracy_threshold=accuracy_threshold
             )
-            print(f"[Peer {peer_id}] ✅ ModelChain validation ENABLED", flush=True)
+            print(f"[Peer {peer_id}] ModelChain validation ENABLED", flush=True)
         else:
             validator, ledger = None, None
         
@@ -837,8 +763,6 @@ def peer_process(seed, split_type, dirichlet_alpha, ml_task, peer_id, bootstrap_
                         training_message += f" Torch threads: {torch.get_num_threads()} (PID: {os.getpid()}). Running on CPU(s): {list(os.sched_getaffinity(0))}."
                     result_queue.put((3, iteration, peer_id, training_loss, training_message, (remaining_batches, training_duration)))
 
-
-                
                 # -------------------- Model Aggregation --------------------
 
                 elif task == "aggregate":
@@ -850,57 +774,31 @@ def peer_process(seed, split_type, dirichlet_alpha, ml_task, peer_id, bootstrap_
                     # To align to real-world scenarios each peer has to compute the number of participating peers via DHT synchronization instead of using the information received from the dispatcher
                     num_participating_peers, _ = count_num_participating_peers(peer_id, iteration, num_peers, dht)
 
-                    # Communication and knowledge distillation or federated averaging
+                    # Communication and federated averaging
                     communicated_bytes = 0
                     kl_factor = 0
                     include_ce_loss = True
                     round = 1
                     group_lengths = []
                     result_1_model, result_1_momentum, group_length, communicated_bytes = communicate_models(TESTING, device, peer_id, num_peers, num_participating_peers, model, momentum_vector, 
-                                                                                                             shared_model_dict, dht, iteration, round, kn_dist_iters, communicated_bytes, validation_loader=validation_loader, validator=validator, ledger=ledger, enable_validation=enable_validation)
+                                                                                                             shared_model_dict, dht, iteration, round, communicated_bytes, validation_loader=validation_loader, validator=validator, ledger=ledger, enable_validation=enable_validation)
                     group_lengths.append(group_length)
                     if result_1_model:
-                        if kn_dist and iteration < kn_dist_iters:
-                            model, momentum_vector, kl_factor = knowledge_distillation(peer_id, model, device, train_loader, result_1_model, momentum_vector, learning_rate, momentum, iteration, kn_dist_iters, kn_dist_no_blending, include_ce_loss)
+                        # Aggregate collected models and momentum vectors
+                        if isinstance(model, ModernBERTClassifier):
+                            model.load_state_dict(result_1_model, strict=False)
+                            trainable_params_indices = [i for i, p in enumerate(model.parameters()) if p.requires_grad]
+                            for i, global_idx in enumerate(trainable_params_indices):
+                                momentum_vector[global_idx] = result_1_momentum[i]
                         else:
-                            if isinstance(model, ModernBERTClassifier):
-                                model.load_state_dict(result_1_model, strict=False)
-                                trainable_params_indices = [i for i, p in enumerate(model.parameters()) if p.requires_grad]
-                                for i, global_idx in enumerate(trainable_params_indices):
-                                    momentum_vector[global_idx] = result_1_momentum[i]
-                            else:
-                                model.load_state_dict(result_1_model, strict=True)
-                                momentum_vector = result_1_momentum
+                            model.load_state_dict(result_1_model, strict=True)
+                            momentum_vector = result_1_momentum
                     else:
                         print(f"[{datetime.now()}] WARNING: Peer {peer_id} could not collect any models in round 1.")
                     del result_1_model, result_1_momentum
                     torch.cuda.empty_cache()
                     gc.collect()
                     
-                    # Communication and federated averaging if knowledge distillation iteration
-                    if kn_dist and iteration < kn_dist_iters:
-
-                        # Synchronization
-                        barrier_key = f"kdfa_{iteration}"
-                        dht.store(f"{barrier_key}_{peer_id}", True, expiration_time=hivemind.get_dht_time() + 60)
-                        wait_for_all(dht, barrier_key, num_peers, num_participating_peers, max_delays=400)
-
-                        # Communication and federated averaging
-                        round = 2
-                        aggregated_state_dict, aggregated_momentum_vector, group_length, communicated_bytes = communicate_models(TESTING, device, peer_id, num_peers, num_participating_peers, model, momentum_vector, shared_model_dict, dht, iteration, round, 0, communicated_bytes)
-                        group_lengths.append(group_length)
-                        if aggregated_state_dict:
-                            if isinstance(model, ModernBERTClassifier):
-                                model.load_state_dict(aggregated_state_dict, strict=False)
-                                trainable_params_indices = [i for i, p in enumerate(model.parameters()) if p.requires_grad]
-                                for i, global_idx in enumerate(trainable_params_indices):
-                                    momentum_vector[global_idx] = aggregated_momentum_vector[i]
-                            else:
-                                model.load_state_dict(aggregated_state_dict, strict=True)
-                                momentum_vector = aggregated_momentum_vector
-                        else:
-                            print(f"[{datetime.now()}] WARNING: Peer {peer_id} could not collect any models in round 2.")
-
                     # If testing iteration then evaluate the model in a subprocess
                     avg_group_length = sum(group_lengths) / len(group_lengths) if group_lengths else 0
                     aggregation_duration = time.time() - start_time_aggregation
@@ -957,7 +855,6 @@ def peer_process(seed, split_type, dirichlet_alpha, ml_task, peer_id, bootstrap_
             pass
         gc.collect()
 
-
 # Periodic cleanup of the shared dictionary to avoid filling up the shared memory with stale data
 def periodic_dict_cleanup(shared_dict, current_iteration):
     if current_iteration == 0:
@@ -971,7 +868,6 @@ def periodic_dict_cleanup(shared_dict, current_iteration):
         print(f"[Dispatcher Cleanup] Shared dictionary cleared successfully.")
     except Exception as e:
         print(f"[Dispatcher Cleanup] Error during shared dictionary cleanup: {e}")
-
 
 # Average models and momentum vectors according to FedAvg
 def fedavg_aggregation(model, models_collected, momentum_vector, momentum_vectors_collected):
@@ -997,7 +893,6 @@ def fedavg_aggregation(model, models_collected, momentum_vector, momentum_vector
             stacked = torch.stack([mv[i].float() for mv in momentum_vectors_collected])
             momentum_vector[i] = stacked.mean(dim=0)
     return model, momentum_vector
-
 
 def dispatcher(max_runtime, ml_task, peer_processes, task_queue, result_queue, device, num_peers, 
                local_update_participation_prob, aggregation_participation_prob, peer_dropout_likelihood, max_iterations, 
@@ -1406,12 +1301,13 @@ def main():
 
         # Create persistent peer processes
         peer_processes = [
+
             ctx.Process(target=peer_process, args=(
                 wandb.config.seed,
                 wandb.config.split_type,
                 wandb.config.dirichlet_alpha,
                 ml_task,
-                i, 
+                i,
                 bootstrap_address, 
                 task_queue, 
                 result_queue, 
@@ -1422,11 +1318,9 @@ def main():
                 shared_model_dict,
                 valid_cores,
                 wandb.config.device,
-                wandb.config.knowledge_distillation,
-                wandb.config.knowledge_distillation_iters,
-                wandb.config.knowledge_distillation_no_blending,
                 copy.deepcopy(model)
             ))
+
             for i in range(wandb.config.num_peers)
         ]
 
@@ -1459,9 +1353,6 @@ def main():
                 dispatcher_patience=wandb.config.dispatcher_patience,
                 learning_rate=wandb.config.learning_rate,
                 momentum=wandb.config.momentum,
-                kn_dist=wandb.config.knowledge_distillation,
-                kn_dist_iters=wandb.config.knowledge_distillation_iters,
-                kn_dist_no_blending=wandb.config.knowledge_distillation_no_blending
             )
         except Exception as e:
             print(f"Main exception: {e}", flush=True)
@@ -1569,9 +1460,6 @@ if __name__ == "__main__":
     parser.add_argument("--ap", type=int, default=100, help="Aggregation participation probability (between 0 and 100)")
     parser.add_argument("--dl", type=int, default=0, help="Peer dropout likelihood (between 0 and 100)")
     parser.add_argument("--iv", type=int, default=4, help="Iterations mechanism value (lower if higher number of peers)")
-    parser.add_argument("--kd", action="store_true", help="Use knowledge distillation during model aggregation?")
-    parser.add_argument("--nb", action="store_true", help="Use knowledge distillation without blending during the entire run?")
-    parser.add_argument("--ds", type=int, default=10, help="How often should a peer see his entire dataset while doing KD?")
     parser.add_argument("--rt", type=int, default=12, help="Maximum allowed runtime in hours")
     parser.add_argument("--sp", type=str, default="iid", choices=["iid","dirichlet"], help="How to split training data across peers")
     parser.add_argument("--al", type=float, default=1.0, help="Dirichlet alpha for non-IID when --sp=dirichlet")
@@ -1590,9 +1478,6 @@ if __name__ == "__main__":
     AGGREGATION_PARTICIPATION_PROB = args.ap
     PEER_DROPOUT_LIKELIHOOD = args.dl
     ITERATIONS_MECHANISM_VALUE = args.iv
-    KNOWLEDGE_DISTILLATION = args.kd
-    KNOWLEDGE_DISTILLATION_NO_BLENDING = args.nb
-    KD_NUM_DATASET_SIGHTINGS = args.ds
     max_runtime = args.rt
     if ML_TASK == "news":
         if args.sp == "dirichlet":
@@ -1622,16 +1507,8 @@ if __name__ == "__main__":
     else:
         raise RuntimeError("ERROR: Invalid iterations mechanism approach!")
     
-    # If necessary determine number of iterations with knowledge distillation
-    knowledge_distillation_iters = 0
-    if KNOWLEDGE_DISTILLATION_NO_BLENDING:
-        knowledge_distillation_iters = MAX_ITERATIONS # NOTE knowledge distillation without blending during the entire run
-    else:
-        if KNOWLEDGE_DISTILLATION:
-            knowledge_distillation_iters = KD_NUM_DATASET_SIGHTINGS * int(TOTAL_BATCHES/mini_batches_per_iteration) # NOTE each peer sees his entire training dataloader's batches 10 times while using KD
-    
     # WandB config
-    unique_run_name = generate_unique_run_name(args.sp, ENTITY, PROJECT, seed, ML_TASK, NUM_PEERS, mini_batches_per_iteration, AGGREGATION_PARTICIPATION_PROB, LOCAL_UPDATE_PARTICIPATION_PROB, PEER_DROPOUT_LIKELIHOOD, KNOWLEDGE_DISTILLATION, knowledge_distillation_iters)
+    unique_run_name = generate_unique_run_name(args.sp, ENTITY, PROJECT, seed, ML_TASK, NUM_PEERS, mini_batches_per_iteration, AGGREGATION_PARTICIPATION_PROB, LOCAL_UPDATE_PARTICIPATION_PROB, PEER_DROPOUT_LIKELIHOOD)
     wandb_dir = "/dss/dssfs04/lwp-dss-0002/pn72yi/pn72yi-dss-0000/ga27fed2/wandb_runs"
     run = wandb.init(
         dir=wandb_dir,
@@ -1655,9 +1532,6 @@ if __name__ == "__main__":
             'convergence_patience': CONVERGENCE_PATIENCE,
             'convergence_threshold': CONVERGENCE_THRESHOLD,
             'dispatcher_patience': DISPATCHER_PATIENCE,
-            'knowledge_distillation': KNOWLEDGE_DISTILLATION,
-            'knowledge_distillation_iters': knowledge_distillation_iters,
-            'knowledge_distillation_no_blending': KNOWLEDGE_DISTILLATION_NO_BLENDING,
             'max_runtime': max_runtime,
             'split_type': args.sp,
             'dirichlet_alpha': args.al

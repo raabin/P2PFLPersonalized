@@ -28,7 +28,7 @@ class SimpleCNN(nn.Module):
         self.fc2 = nn.Linear(128, 10)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))     
+        x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = self.pool(x)
         x = torch.flatten(x, 1)
@@ -98,9 +98,6 @@ class AdvancedModernBERTClassifier(nn.Module):
         return logits
 
 
-
-
-
 # -------------------- 2. Data Loaders --------------------
 
 # Helper function for creating non-IID MNIST splits
@@ -125,6 +122,7 @@ def get_mnist_data_loaders_dirichlet(
     seed: int = 42,
     batch_size: int = 64,
     alpha: float = 1.0,
+    validation_split: float = 0.1,
 ):
     import numpy as np
     from torch.utils.data import Subset
@@ -149,13 +147,27 @@ def get_mnist_data_loaders_dirichlet(
     train_ds = datasets.MNIST(root="./data", train=True, download=True, transform=tfm)
     test_ds  = datasets.MNIST(root="./data", train=False, transform=tfm)
 
+
+    # Deterministic train/val split
+    total_size = len(train_ds)
+    partition_size = total_size // num_partitions
+    start_idx = partition * partition_size
+    valid_idx = (partition + 1) * partition_size * validation_split if partition != num_partitions - 1 else total_size * (1 - validation_split)
+    end_idx = (partition + 1) * partition_size if partition != num_partitions - 1 else total_size
+    partition_indices = list(range(valid_idx, end_idx))
+    valid_ds = Subset(train_ds, list(range(start_idx, valid_idx)))
+    train_ds = Subset(train_ds, partition_indices)
+
+
     train_clients = _dirichlet_client_indices(np.array(train_ds.targets), num_partitions, alpha, rng)
+    valid_clients = _dirichlet_client_indices(np.array(valid_ds.targets), num_partitions, alpha, rng)
     test_clients  = _dirichlet_client_indices(np.array(test_ds.targets),  num_partitions, alpha, rng)
 
     g = torch.Generator().manual_seed(seed + partition)
     train_loader = DataLoader(Subset(train_ds, train_clients[partition]), batch_size=batch_size, shuffle=True,  generator=g)
+    valid_loader = DataLoader(Subset(valid_ds, valid_clients[partition]), batch_size=batch_size, shuffle=False)
     test_loader  = DataLoader(Subset(test_ds,  test_clients[partition]),  batch_size=batch_size, shuffle=False)
-    return train_loader, None, test_loader
+    return train_loader, valid_loader, test_loader
 
 # Create non-IID NEWS loader
 def get_text_data_loaders_dirichlet(
@@ -165,6 +177,7 @@ def get_text_data_loaders_dirichlet(
     batch_size: int = 16,
     alpha: float = 1.0,
     dataset_name: str = "SetFit/20_newsgroups",
+    validation_split: float = 0.1
 ):
     """
     Create non-IID Newsgroups splits with a per-class Dirichlet(alpha) over clients
@@ -233,7 +246,7 @@ def get_text_data_loaders_dirichlet(
     return TextDataLoaderWrapper(train_loader), None, TextDataLoaderWrapper(test_loader)
 
 # MNIST data loaders designed for federated learning and clients with strict dataset seperation
-def get_mnist_data_loaders(partition, num_partitions, seed=42, batch_size=64):
+def get_mnist_data_loaders(partition, num_partitions, seed=42, batch_size=64, validation_split=0.1):
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
@@ -257,19 +270,22 @@ def get_mnist_data_loaders(partition, num_partitions, seed=42, batch_size=64):
     total_size = len(dataset)
     partition_size = total_size // num_partitions
     start_idx = partition * partition_size
+    valid_idx = (partition + 1) * partition_size * validation_split if partition != num_partitions - 1 else total_size * (1 - validation_split)
     end_idx = (partition + 1) * partition_size if partition != num_partitions - 1 else total_size
-    partition_indices = list(range(start_idx, end_idx))
+    partition_indices = list(range(valid_idx, end_idx))
+    valid_dataset = Subset(dataset, list(range(start_idx, valid_idx)))
     train_dataset = Subset(dataset, partition_indices)
 
     # Create data loaders
     g = torch.Generator()
     g.manual_seed(seed + partition) # NOTE partition-specific seeding to align with FL principles
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=g)
+    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    return train_loader, None, test_loader
+    return train_loader, valid_loader, test_loader
 
 # Newsgroup data loaders designed for federated learning and clients with strict dataset seperation (smaller default batch size to avoid OOMs due to ModernBERTs huge size)
-def get_text_data_loaders(partition, num_partitions, seed=42, batch_size=16, dataset_name="SetFit/20_newsgroups"):
+def get_text_data_loaders(partition, num_partitions, seed=42, batch_size=16, dataset_name="SetFit/20_newsgroups", validation_split=0.1):
 
     # NOTE align global batch size to 125 peers case:
     # (c) NEWS & 16 peers: 125 (divided by 5 yields 25 => choose batch size 25 and x5 number of mini batches per FL iteration in shell script)
@@ -306,16 +322,17 @@ def get_text_data_loaders(partition, num_partitions, seed=42, batch_size=16, dat
     total_size = len(tokenized_dataset)
     partition_size = total_size // num_partitions
     start_idx = partition * partition_size
+    valid_idx = (partition + 1) * partition_size * validation_split if partition != num_partitions - 1 else total_size * (1 - validation_split)
     end_idx = (partition + 1) * partition_size if partition != num_partitions - 1 else total_size
-    partition_indices = list(range(start_idx, end_idx))
+    partition_indices = list(range(valid_idx, end_idx))
+    valid_partition = Subset(tokenized_dataset, list(range(start_idx, valid_idx)))
     train_partition = Subset(tokenized_dataset, partition_indices)
-
     # Create DataLoaders
     g = torch.Generator()
     g.manual_seed(seed + partition) # NOTE partition-specific seeding to align with FL principles
     train_loader = DataLoader(train_partition, batch_size=batch_size, shuffle=True, generator=g)
     test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False)
-    
+    valid_loader = DataLoader(valid_partition, batch_size=batch_size, shuffle=False)
     # The training function expects (data, target) so we need a wrapper
     class TextDataLoaderWrapper:
         def __init__(self, loader):
@@ -327,7 +344,7 @@ def get_text_data_loaders(partition, num_partitions, seed=42, batch_size=16, dat
                 yield data, target
         def __len__(self):
             return len(self.loader)
-    return TextDataLoaderWrapper(train_loader), None, TextDataLoaderWrapper(test_loader)
+    return TextDataLoaderWrapper(train_loader), TextDataLoaderWrapper(valid_loader), TextDataLoaderWrapper(test_loader)
 
 
 
@@ -394,7 +411,7 @@ def train_num_mini_batches_manually(model, device, train_loader, learning_rate, 
         return avg_loss, training_message, end_idx, momentum_vector, delta_vector, all_logits
     else:
         return avg_loss, training_message, end_idx, momentum_vector, delta_vector
-    
+
 # Pass through num_mini_batches starting at next_batch_idx & thereby apply manually implemented sgd updates with momentum to enable exchanging optimizer states between peers
 def train_num_mini_batches_manually_WITHOUT_BERT(model, device, train_loader, learning_rate, momentum, momentum_vector, peer_id="X", num_mini_batches=1, next_batch_idx=0, do_dp=False, return_logits=False):
     if isinstance(model, list) and len(model) == 1 and isinstance(model[0], torch.nn.Module): # NOTE Auto-correct if model is a list of one item
@@ -608,253 +625,6 @@ def evaluate_WITHOUT_BERT(model, device, loader, label="Validation", peer_id="X"
     avg_loss = loss_sum / len(loader)
     print(f"Peer {peer_id}: {label} accuracy: {acc:.2f}%, Loss: {avg_loss:.4f}")
     return acc, avg_loss
-
-
-
-
-
-# -------------------- 4. Knowledge Distillation --------------------
-
-# Knowledge distillation using the top-k most similar models by training the peer's student model with a hybrid loss of 1) KL-divergence loss between the peer's and the teacher's output distributions and 2) cross-entropy loss using ground truth data
-def knowledge_distillation(peer_id, model, device, train_loader, models_collected, momentum_vector, learning_rate, momentum, iteration, kn_dist_iters, kn_dist_no_blending, include_ce_loss, top_k_ratio=0.4, temperature=3.0, epochs=1):
-    model.eval()
-    student_logits_list = []
-    ground_truth_labels = []
-
-    try: # NOTE sanity checking whether model is on device
-        model_device = next(model.parameters()).device
-        print(f"[{peer_id}] Model on device: {model_device}", flush=True)
-    except Exception as e:
-        print(f"[{peer_id}] ERROR accessing model device: {e}", flush=True)
-
-    # 0v4: create data loader
-    distill_loader = []
-    seen_indices = set()
-    for i, (data_batch, y) in enumerate(train_loader):
-        if len(distill_loader) >= 8:
-            break        
-        if isinstance(data_batch, dict):
-            batch_indices = tuple(data_batch['input_ids'].view(data_batch['input_ids'].shape[0], -1).sum(dim=1).tolist()) # NOTE for BERT use input_ids to create a unique identifier for the batch
-        else:
-            batch_indices = tuple(data_batch.view(data_batch.shape[0], -1).sum(dim=1).tolist()) # NOTE original logic for MNIST
-        if batch_indices in seen_indices:
-            continue
-        seen_indices.add(batch_indices)
-        if isinstance(data_batch, dict):
-            distill_loader.append(({'input_ids': data_batch['input_ids'].to(device), 'attention_mask': data_batch['attention_mask'].to(device)}, y.to(device)))
-        else:
-            distill_loader.append((data_batch.to(device), y.to(device)))
-    if len(distill_loader) < 1:
-        print(f"[{peer_id}] WARNING: distill_loader is empty, skipping distillation.")
-        return model, momentum_vector, 0
-
-    # 1v4: get student logits
-    with torch.no_grad():
-        for i, (data, labels) in enumerate(distill_loader):
-            if isinstance(data, dict):
-                student_logits = model(input_ids=data['input_ids'], attention_mask=data['attention_mask'])
-            else:
-                student_logits = model(data)
-            student_logits_list.append(student_logits.cpu())
-            ground_truth_labels.append(labels.cpu()) # NOTE move labels to CPU to match logits
-
-    # 2v4: compare student logits to candidate teacher models
-    kl_scores = []
-    teacher_logits_list_by_model = []
-    if isinstance(model, ModernBERTClassifier):
-        temp_model = ModernBERTClassifier().to(device)
-    else:
-        temp_model = SimpleCNN().to(device)
-    for peer_state in models_collected:
-        if isinstance(model, ModernBERTClassifier):
-            temp_model.load_state_dict(peer_state, strict=False)
-        else:
-            temp_model.load_state_dict(peer_state, strict=True)
-        temp_model.eval()
-        kl_total = 0.0
-        logits_batches = []
-        with torch.no_grad():
-            for batch_idx, (data, _) in enumerate(distill_loader):
-                if isinstance(data, dict):
-                    t_logits = temp_model(input_ids=data['input_ids'], attention_mask=data['attention_mask']).cpu()
-                else:
-                    t_logits = temp_model(data).cpu()
-                logits_batches.append(t_logits)
-                s_logits = student_logits_list[batch_idx]
-                kl = F.kl_div( # NOTE compute KL divergence between teacher's softened logits and student's corresponding logits
-                    F.log_softmax(s_logits / temperature, dim=1),
-                    F.softmax(t_logits / temperature, dim=1),
-                    reduction='batchmean'
-                )
-                kl_total += kl.item()
-        kl_scores.append(kl_total) # NOTE collect KL scores to select most informative teacher models
-        teacher_logits_list_by_model.append(logits_batches)
-
-    # 3v4: select top-k teacher models
-    num_top_k = max(1, int(top_k_ratio * len(models_collected)))
-    top_k_indices = sorted(range(len(kl_scores)), key=lambda i: kl_scores[i])[:num_top_k]
-    print(f"[Peer {peer_id}] Using top-{num_top_k} models for distillation.")
-
-    # 4v4: distill knowledge from top-k teachers (=> train our student model using a hybrid loss of 1) KL divergence loss between student model and teacher model output distributions and 2) cross-entropy loss between student predictions and the true labels)
-    model.train()
-    momentum_vector = [m.to(device) for m in momentum_vector]
-    kl_factor = 0
-    for epoch in range(epochs):
-        for batch_idx, (data, target) in enumerate(distill_loader):
-            target = target.to(device)
-            if isinstance(data, dict):
-                student_logits = model(input_ids=data['input_ids'], attention_mask=data['attention_mask'])
-            else:
-                student_logits = model(data)
-            avg_teacher_logits = torch.mean(torch.stack([teacher_logits_list_by_model[i][batch_idx] for i in top_k_indices]), dim=0).to(device)
-            kl_loss = F.kl_div(F.log_softmax(student_logits / temperature, dim=1), F.softmax(avg_teacher_logits / temperature, dim=1), reduction='batchmean') * (temperature ** 2)
-            if include_ce_loss:
-                ce_loss = F.cross_entropy(student_logits, target)
-                if kn_dist_no_blending:
-                    loss = kl_loss + ce_loss
-                    kl_factor = 1
-                else:
-                    kl_factor = max(0.0, 1.0 - (iteration / kn_dist_iters))
-                    loss = (kl_factor * kl_loss) + ((1 - kl_factor) * ce_loss)
-            else:
-                loss = kl_loss
-                kl_factor = 1.0
-            if torch.isnan(loss):
-                print(f"[Peer {peer_id}] ❌ NaN loss! Skipping this batch!", flush=True)
-                continue
-            model.zero_grad()
-            loss.backward()
-            for param in model.parameters():
-                if param.grad is not None and torch.isnan(param.grad).any():
-                    print(f"[Peer {peer_id}] ❌ NaN grad detected! Aborting training!", flush=True)
-                    raise ValueError("Gradient contains NaNs.")
-            with torch.no_grad(): # NOTE update the student model manually to allow sharing optimizer states across peers
-                for param, m_vec in zip(model.parameters(), momentum_vector):
-                    if param.grad is None:
-                        continue
-                    m_vec.mul_(momentum).add_(param.grad, alpha=(1 - momentum))
-                    param.data.add_(m_vec, alpha=-learning_rate)
-        print(f"[Peer {peer_id}] Epoch {epoch + 1}: Distillation loss = {loss.item():.4f}")
-    return model, momentum_vector, kl_factor
-
-# Knowledge distillation using the top-k most similar models by training the peer's student model with a hybrid loss of 1) KL-divergence loss between the peer's and the teacher's output distributions and 2) cross-entropy loss using ground truth data
-def knowledge_distillation_WITHOUT_BERT(peer_id, model, device, train_loader, models_collected, momentum_vector, learning_rate, momentum, iteration, kn_dist_iters, kn_dist_no_blending, include_ce_loss, temperature=3.0, top_k_ratio=0.4, epochs=1):
-    model.eval()
-    student_logits_list = []
-    ground_truth_labels = []
-
-    try: # NOTE sanity checking whether model is on device
-        model_device = next(model.parameters()).device
-        print(f"[{peer_id}] Model on device: {model_device}", flush=True)
-    except Exception as e:
-        print(f"[{peer_id}] ERROR accessing model device: {e}", flush=True)
-
-    # 0v4: create data loader
-    distill_loader = []
-    seen_indices = set()
-    for i, (x, y) in enumerate(train_loader):
-        if len(distill_loader) >= 8:
-            break
-        batch_indices = tuple(x.view(x.shape[0], -1).sum(dim=1).tolist())
-        if batch_indices in seen_indices:
-            continue
-        seen_indices.add(batch_indices)
-        distill_loader.append((x.to(device), y.to(device)))
-    if len(distill_loader) < 1:
-        print(f"[{peer_id}] WARNING: distill_loader is empty, skipping distillation.")
-        return model, momentum_vector, 0
-
-    # 1v4: get student logits
-    with torch.no_grad():
-        for i, (data, labels) in enumerate(distill_loader):
-            data = data.to(device)
-            if data.device != model_device:
-                print(f"[{peer_id}] WARNING: model on {model_device}, but data on {data.device}", flush=True)
-            try:
-                student_logits = model(data)
-                student_logits_list.append(student_logits.cpu())
-                ground_truth_labels.append(labels)
-            except Exception as e:
-                print(f"[{peer_id}] ERROR during model(data) on batch {i}: {e}", flush=True)
-                raise
-
-    # 2v4: compare student logits to candidate teacher models
-    kl_scores = []
-    teacher_logits_list_by_model = []
-    temp_model = type(model)().to(device)
-    for peer_state in models_collected:
-        if isinstance(peer_state, torch.nn.Module):
-            peer_state = peer_state.state_dict()
-        temp_model.load_state_dict(peer_state)
-        temp_model.eval()
-        kl_total = 0.0
-        logits_batches = []
-        with torch.no_grad():
-            for batch_idx, (data, _) in enumerate(distill_loader):
-                data = data.to(device)
-                if batch_idx >= len(student_logits_list):
-                    print(f"[{peer_id}] WARNING: student_logits_list too short! Skipping batch {batch_idx}", flush=True)
-                    continue
-                t_logits = temp_model(data).cpu()
-                logits_batches.append(t_logits)
-                s_logits = student_logits_list[batch_idx]
-                kl = F.kl_div( # NOTE compute KL divergence between teacher's softened logits and student's corresponding logits
-                    F.log_softmax(s_logits / temperature, dim=1),
-                    F.softmax(t_logits / temperature, dim=1),
-                    reduction='batchmean'
-                )
-                kl_total += kl.item()
-        kl_scores.append(kl_total) # NOTE collect KL scores to select most informative teacher models
-        teacher_logits_list_by_model.append(logits_batches)
-
-    # 3v4: select top-k teacher models
-    num_top_k = max(1, int(top_k_ratio * len(models_collected)))
-    top_k_indices = sorted(range(len(kl_scores)), key=lambda i: kl_scores[i])[:num_top_k]
-    print(f"[Peer {peer_id}] Using top-{num_top_k} models for distillation.")
-
-    # 4v4: distill knowledge from top-k teachers (=> train our student model using a hybrid loss of 1) KL divergence loss between student model and teacher model output distributions and 2) cross-entropy loss between student predictions and the true labels)
-    model.train()
-    momentum_vector = [m.to(device) for m in momentum_vector]
-    kl_factor = 0
-    for epoch in range(epochs):
-        for batch_idx, (data, target) in enumerate(distill_loader):
-            data, target = data.to(device), target.to(device)
-            student_logits = model(data)
-            avg_teacher_logits = torch.mean(torch.stack([teacher_logits_list_by_model[i][batch_idx] for i in top_k_indices]), dim=0).to(device) # NOTE compute average teacher logits
-            student_soft = F.log_softmax(student_logits / temperature, dim=1)
-            teacher_soft = F.softmax(avg_teacher_logits / temperature, dim=1)
-            kl_loss = F.kl_div(student_soft, teacher_soft, reduction='batchmean') * (temperature ** 2) # NOTE compute KL divergence between student's logits and average teacher logits
-            if include_ce_loss: # NOTE include cross-entropy loss in the distillation loss to ground learning and stabilize training
-                ce_loss = F.cross_entropy(student_logits, target)
-                if kn_dist_no_blending:
-                    loss = kl_loss + ce_loss
-                    kl_factor = 1 # NOTE for correct logging
-                else:
-                    kl_factor = max(0.0, 1.0 - (iteration / kn_dist_iters)) # NOTE linearly blend the KL factor
-                    ce_factor = 1.0
-                    loss = kl_factor * kl_loss + ce_factor * ce_loss
-            else:
-                loss = kl_loss
-                kl_factor = 1.0
-            if torch.isnan(loss):
-                print(f"[Peer {peer_id}] ❌ NaN loss! Skipping this batch!", flush=True)
-                continue
-            model.zero_grad()
-            loss.backward()
-            for param in model.parameters():
-                if param.grad is not None and torch.isnan(param.grad).any():
-                    print(f"[Peer {peer_id}] ❌ NaN grad detected! Aborting training!", flush=True)
-                    raise ValueError("Gradient contains NaNs.")
-            with torch.no_grad(): # NOTE update the student model manually to allow sharing optimizer states across peers
-                for param, m_vec in zip(model.parameters(), momentum_vector):
-                    if param.grad is None:
-                        continue
-                    m_vec.mul_(momentum).add_(param.grad, alpha=(1 - momentum))
-                    param.data.add_(m_vec, alpha=-learning_rate)
-        print(f"[Peer {peer_id}] Epoch {epoch + 1}: Distillation loss = {loss.item():.4f}")
-    return model, momentum_vector, kl_factor
-
-
 
 
 
