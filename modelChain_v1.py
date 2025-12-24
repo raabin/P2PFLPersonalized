@@ -41,7 +41,7 @@ KD_NUM_DATASET_SIGHTINGS = 10                                               # NO
 
 TESTING = False
 
-ENTITY = "FedMoshpitAvg"
+ENTITY = "P2PFLPersonalized"
 PROJECT = "p2p_fl"
 
 DEVICE = "cuda"                                                             # NOTE "cpu" or "cuda"
@@ -67,7 +67,9 @@ CONVERGENCE_THRESHOLD = 1e-3
 
 DISPATCHER_PATIENCE = 30 * 60
 
-
+ACCURACY_THRESHOLD = 0.0      # Minimum accuracy improvement to accept update (percentage points)
+LOSS_THRESHOLD = 0.0          # Minimum loss reduction to accept update
+ENABLE_VALIDATION = True
 
 # ==================== UTILITY VALIDATOR ====================
 
@@ -78,32 +80,12 @@ class UtilityValidator:
     Tests if an incoming model update improves performance on the peer's
     local validation set. This is the "proof of utility" - analogous to
     proof-of-work in blockchain.
-    
-    Thread-safe: Can be used concurrently by multiple validation tasks.
-    Memory-efficient: Uses temporary models that are cleaned up after validation.
-    
-    Args:
-        config (dict): Configuration with validation thresholds
-            - accuracy_threshold (float): Minimum accuracy improvement (default: 0.02)
-            - loss_threshold (float): Minimum loss reduction (default: 0.0)
-    
-    Example:
-        >>> config = {'accuracy_threshold': 0.02, 'loss_threshold': 0.0}
-        >>> validator = UtilityValidator(config)
-        >>> result = validator.validate(my_model, incoming_state, device, val_loader, 0)
-        >>> print(f"Accept update: {result['valid']}")
     """
     
     def __init__(self, config: Dict[str, Any]):
         """Initialize validator with thresholds from config."""
-        self.accuracy_threshold = config.get('accuracy_threshold', 0.02)
+        self.accuracy_threshold = config.get('accuracy_threshold', 0.0)
         self.loss_threshold = config.get('loss_threshold', 0.0)
-        
-        # Validate config
-        if self.accuracy_threshold < 0:
-            raise ValueError(f"accuracy_threshold must be >= 0, got {self.accuracy_threshold}")
-        if not isinstance(self.accuracy_threshold, (int, float)):
-            raise TypeError(f"accuracy_threshold must be numeric, got {type(self.accuracy_threshold)}")
         
     def validate(
         self, 
@@ -111,21 +93,11 @@ class UtilityValidator:
         incoming_state_dict: Dict[str, torch.Tensor], 
         device: torch.device, 
         validation_loader, 
-        peer_id: int
+        peer_id: int,
+        source_peer_id: int = -1
     ) -> Dict[str, Any]:
         """
         Validate if incoming model improves performance on local validation set.
-        
-        This is the core validation logic: we test the incoming model on OUR data
-        and only accept it if it improves OUR performance. This ensures intentional
-        model divergence where each peer optimizes for their own task.
-        
-        Args:
-            peer_model: Current local model (will not be modified)
-            incoming_state_dict: State dict of incoming model update
-            device: Torch device for computation (cuda or cpu)
-            validation_loader: DataLoader with validation data
-            peer_id: ID of the peer (for logging)
         
         Returns:
             dict: Validation result containing:
@@ -134,9 +106,6 @@ class UtilityValidator:
                 - baseline_metrics (dict): Current model performance
                 - incoming_metrics (dict): Incoming model performance
                 - decision_reason (str): Human-readable explanation
-        
-        Raises:
-            No exceptions raised - all errors are caught and returned as rejection
         """
         try:
             # Step 1: Evaluate current model (baseline)
@@ -147,16 +116,15 @@ class UtilityValidator:
             
             # Step 3: Try to load incoming state dict
             try:
-                temp_model.load_state_dict(incoming_state_dict, strict=True)
+                temp_model.load_state_dict(incoming_state_dict, strict=False)
             except RuntimeError as e:
-                # Architecture mismatch - cannot integrate this update
                 del temp_model
                 return {
                     'valid': False,
                     'improvement': {'accuracy_delta': -999.0, 'loss_delta': -999.0},
                     'baseline_metrics': baseline_metrics,
                     'incoming_metrics': {'accuracy': 0.0, 'loss': float('inf'), 'samples_evaluated': 0},
-                    'decision_reason': f"[Peer {peer_id}] ❌ REJECT: Architecture mismatch - {str(e)[:100]}"
+                    'decision_reason': f"[Peer {peer_id}] REJECT from Peer {source_peer_id}: Architecture mismatch"
                 }
             
             # Step 4: Evaluate incoming model
@@ -170,13 +138,13 @@ class UtilityValidator:
             
             # Step 6: Make decision based on thresholds
             is_beneficial = (
-                improvement['accuracy_delta'] > self.accuracy_threshold and
+                improvement['accuracy_delta'] > self.accuracy_threshold or
                 improvement['loss_delta'] > self.loss_threshold
             )
             
-            decision_reason = self._get_decision_reason(improvement, is_beneficial, peer_id)
+            decision_reason = self._get_decision_reason(improvement, is_beneficial, peer_id, source_peer_id)
             
-            # Step 7: Cleanup temporary model
+            # Step 7: Cleanup
             del temp_model
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -190,91 +158,53 @@ class UtilityValidator:
             }
             
         except Exception as e:
-            # Catch-all for unexpected errors - reject by default for safety
             return {
                 'valid': False,
                 'improvement': {'accuracy_delta': -999.0, 'loss_delta': -999.0},
                 'baseline_metrics': {'accuracy': 0.0, 'loss': float('inf'), 'samples_evaluated': 0},
                 'incoming_metrics': {'accuracy': 0.0, 'loss': float('inf'), 'samples_evaluated': 0},
-                'decision_reason': f"[Peer {peer_id}] ❌ REJECT: Validation error - {str(e)[:100]}"
+                'decision_reason': f"[Peer {peer_id}] REJECT from Peer {source_peer_id}: Validation error - {str(e)[:50]}"
             }
     
-    def _evaluate_model(
-        self, 
-        model: nn.Module, 
-        device: torch.device, 
-        validation_loader
-    ) -> Dict[str, float]:
-        """
-        Evaluate model on validation dataset.
-        
-        Args:
-            model: Model to evaluate
-            device: Computation device
-            validation_loader: DataLoader with validation data
-        
-        Returns:
-            dict: Metrics containing accuracy, loss, samples_evaluated
-        """
-        model.eval()  # Set to evaluation mode
+    def _evaluate_model(self, model: nn.Module, device: torch.device, validation_loader) -> Dict[str, float]:
+        """Evaluate model on validation dataset."""
+        model.eval()
         correct = 0
         total = 0
         total_loss = 0.0
         num_batches = 0
         
-        with torch.no_grad():  # Disable gradient computation
+        with torch.no_grad():
             for data, target in validation_loader:
                 try:
-                    # Move data to device
-                    data, target = data.to(device), target.to(device)
+                    target = target.to(device)
+                    if isinstance(data, dict):
+                        input_ids = data['input_ids'].to(device)
+                        attention_mask = data['attention_mask'].to(device)
+                        output = model(input_ids=input_ids, attention_mask=attention_mask)
+                    else:
+                        data = data.to(device)
+                        output = model(data)
                     
-                    # Forward pass
-                    output = model(data)
-                    
-                    # Compute loss
                     loss = torch.nn.functional.cross_entropy(output, target, reduction='mean')
                     total_loss += loss.item()
                     num_batches += 1
-                    
-                    # Compute accuracy
                     pred = output.argmax(dim=1, keepdim=True)
                     correct += pred.eq(target.view_as(pred)).sum().item()
                     total += target.size(0)
-                    
                 except Exception as e:
-                    # Skip bad batches but continue evaluation
-                    print(f"⚠️  Evaluation batch error: {e}", flush=True)
                     continue
         
-        # Compute final metrics (handle edge cases)
         accuracy = (correct / total * 100.0) if total > 0 else 0.0
         avg_loss = (total_loss / num_batches) if num_batches > 0 else float('inf')
-        
-        return {
-            'accuracy': accuracy,
-            'loss': avg_loss,
-            'samples_evaluated': total
-        }
+        return {'accuracy': accuracy, 'loss': avg_loss, 'samples_evaluated': total}
     
-    def _get_decision_reason(
-        self, 
-        improvement: Dict[str, float], 
-        is_beneficial: bool, 
-        peer_id: int
-    ) -> str:
-        """Generate human-readable decision reason."""
+    def _get_decision_reason(self, improvement: Dict[str, float], is_beneficial: bool, peer_id: int, source_peer_id: int) -> str:
         if is_beneficial:
-            return (
-                f"[Peer {peer_id}] ✅ ACCEPT: "
-                f"Accuracy +{improvement['accuracy_delta']:.4f}%, "
-                f"Loss -{improvement['loss_delta']:.4f}"
-            )
+            return f"[Peer {peer_id}] ACCEPT from Peer {source_peer_id}: Accuracy {improvement['accuracy_delta']:+.2f}%, Loss {improvement['loss_delta']:+.4f}"
         else:
-            return (
-                f"[Peer {peer_id}] ❌ REJECT: "
-                f"Accuracy {improvement['accuracy_delta']:+.4f}% "
-                f"(threshold: {self.accuracy_threshold}%)"
-            )
+            return f"[Peer {peer_id}] REJECT from Peer {source_peer_id}: Accuracy {improvement['accuracy_delta']:+.2f}% (threshold: {self.accuracy_threshold}%)"
+
 
 
 # ==================== MODEL LEDGER ====================
@@ -282,46 +212,16 @@ class UtilityValidator:
 class ModelLedger:
     """
     Blockchain-like ledger for tracking model evolution history.
-    
-    Records all integration and rejection decisions, providing a complete
-    audit trail of how the local model evolved over time.
-    
-    Thread-safe: Can be accessed concurrently (Python GIL provides safety for basic ops).
-    Persistent: Can be saved/loaded to disk (future enhancement).
-    
-    Args:
-        peer_id (int): ID of the peer owning this ledger
-    
-    Example:
-        >>> ledger = ModelLedger(peer_id=0)
-        >>> ledger.add_integration(iteration=5, sender_id=2, validation_result=result)
-        >>> stats = ledger.get_statistics()
-        >>> print(f"Acceptance rate: {stats['acceptance_rate']:.2%}")
+    Records all integration and rejection decisions.
     """
     
     def __init__(self, peer_id: int):
-        """Initialize ledger for a peer."""
         self.peer_id = peer_id
-        self.chain: List[Dict] = []  # Accepted updates (blockchain-like chain)
-        self.rejected_cache: Dict[str, Dict] = {}  # Rejected updates (cache)
+        self.chain: List[Dict] = []
+        self.rejected_cache: Dict[str, Dict] = {}
         
-    def add_integration(
-        self, 
-        iteration: int, 
-        sender_id: int, 
-        validation_result: Dict[str, Any]
-    ) -> None:
-        """
-        Add an accepted update to the ledger chain.
-        
-        Creates a new block in the chain with all relevant information
-        about the integration decision.
-        
-        Args:
-            iteration: FL iteration number
-            sender_id: ID of peer who sent the update
-            validation_result: Full validation result dict from validator
-        """
+    def add_integration(self, iteration: int, sender_id: int, validation_result: Dict[str, Any]) -> None:
+        """Add an accepted update to the ledger chain."""
         block = {
             'block_number': len(self.chain),
             'timestamp': time.time(),
@@ -332,22 +232,8 @@ class ModelLedger:
         }
         self.chain.append(block)
         
-    def add_rejection(
-        self, 
-        iteration: int, 
-        sender_id: int, 
-        validation_result: Dict[str, Any]
-    ) -> None:
-        """
-        Add a rejected update to the rejection cache.
-        
-        Stores reason for rejection for debugging and analysis.
-        
-        Args:
-            iteration: FL iteration number
-            sender_id: ID of peer who sent the update
-            validation_result: Full validation result dict from validator
-        """
+    def add_rejection(self, iteration: int, sender_id: int, validation_result: Dict[str, Any]) -> None:
+        """Add a rejected update to the rejection cache."""
         key = f"{iteration}_{sender_id}"
         self.rejected_cache[key] = {
             'timestamp': time.time(),
@@ -357,36 +243,17 @@ class ModelLedger:
         }
     
     def get_statistics(self) -> Dict[str, float]:
-        """
-        Compute aggregate statistics from the ledger.
-        
-        Returns:
-            dict: Statistics containing:
-                - total_integrations: Number of accepted updates
-                - total_rejections: Number of rejected updates
-                - acceptance_rate: Fraction of accepted updates (0.0 to 1.0)
-                - avg_accuracy_gain: Average accuracy improvement per integration
-                - avg_loss_reduction: Average loss reduction per integration
-        """
+        """Compute aggregate statistics from the ledger."""
         total_integrations = len(self.chain)
         total_rejections = len(self.rejected_cache)
         
-        # Compute averages (handle empty ledger)
         if total_integrations > 0:
-            avg_accuracy_gain = sum(
-                block['improvement'].get('accuracy_delta', 0.0) 
-                for block in self.chain
-            ) / total_integrations
-            
-            avg_loss_reduction = sum(
-                block['improvement'].get('loss_delta', 0.0) 
-                for block in self.chain
-            ) / total_integrations
+            avg_accuracy_gain = sum(block['improvement'].get('accuracy_delta', 0.0) for block in self.chain) / total_integrations
+            avg_loss_reduction = sum(block['improvement'].get('loss_delta', 0.0) for block in self.chain) / total_integrations
         else:
             avg_accuracy_gain = 0.0
             avg_loss_reduction = 0.0
         
-        # Compute acceptance rate (handle no decisions)
         total_decisions = total_integrations + total_rejections
         acceptance_rate = (total_integrations / total_decisions) if total_decisions > 0 else 0.0
         
@@ -397,65 +264,14 @@ class ModelLedger:
             'avg_accuracy_gain': avg_accuracy_gain,
             'avg_loss_reduction': avg_loss_reduction
         }
-    
-    def get_recent_integrations(self, n: int = 10) -> List[Dict]:
-        """Get the n most recent integrations."""
-        return self.chain[-n:] if len(self.chain) >= n else self.chain
-    
-    def clear_old_rejections(self, keep_last_n: int = 100) -> None:
-        """
-        Clear old rejections to save memory.
-        
-        Keeps only the most recent N rejections. Useful for long-running
-        experiments to prevent unbounded memory growth.
-        
-        Args:
-            keep_last_n: Number of most recent rejections to keep
-        """
-        if len(self.rejected_cache) > keep_last_n:
-            # Sort by timestamp and keep most recent
-            sorted_items = sorted(
-                self.rejected_cache.items(), 
-                key=lambda x: x[1]['timestamp'],
-                reverse=True
-            )
-            self.rejected_cache = dict(sorted_items[:keep_last_n])
-
 
 # ==================== HELPER FUNCTION ====================
 
-def create_validation_components(
-    peer_id: int,
-    accuracy_threshold: float = 0.02,
-    loss_threshold: float = 0.0
-) -> Tuple[UtilityValidator, ModelLedger]:
-    """
-    Factory function to create validator and ledger together.
-    
-    Convenience function for quick setup of ModelChain components.
-    
-    Args:
-        peer_id: ID of the peer
-        accuracy_threshold: Minimum accuracy improvement to accept update (0.02 = 2%)
-        loss_threshold: Minimum loss reduction to accept update
-    
-    Returns:
-        (validator, ledger) tuple
-    
-    Example:
-        >>> validator, ledger = create_validation_components(
-        ...     peer_id=0,
-        ...     accuracy_threshold=0.02
-        ... )
-        >>> # Now ready to use for validation
-    """
-    config = {
-        'accuracy_threshold': accuracy_threshold,
-        'loss_threshold': loss_threshold
-    }
+def create_validation_components(peer_id: int, accuracy_threshold: float = 0.0, loss_threshold: float = 0.0) -> Tuple[UtilityValidator, ModelLedger]:
+    """Factory function to create validator and ledger together."""
+    config = {'accuracy_threshold': accuracy_threshold, 'loss_threshold': loss_threshold}
     validator = UtilityValidator(config)
     ledger = ModelLedger(peer_id)
-    
     return validator, ledger
 
 
@@ -605,39 +421,73 @@ def communicate_models(testing, device, peer_id, num_peers, num_participating_pe
 
     # 1v5: initialize sum with own model/momentum
     if isinstance(model, ModernBERTClassifier):
-        sum_state_dict = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
-        sum_momentum_vector = [mv.clone() for p, mv in zip(model.parameters(), momentum_vector) if p.requires_grad]
+        integrated_state_dict = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
+        integrated_momentum = [mv.clone() for p, mv in zip(model.parameters(), momentum_vector) if p.requires_grad]
     else:
-        sum_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
-        sum_momentum_vector = [mv.clone() for mv in momentum_vector]
-    model_count = 1
+        integrated_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+        integrated_momentum = [mv.clone() for mv in momentum_vector]
+    integrated_count = 1
+    accepted_peers = [peer_id]
+    rejected_peers = []
 
     # 2v5: stream, sum and discard models from other peers
-    for peer in written_members:
-        if peer == peer_id: continue
+    for source_peer in written_members:
+        if source_peer == peer_id: continue
         try:
-            entry = shared_model_dict[(iter_key, peer)]
+            entry = shared_model_dict[(iter_key, source_peer)]
             incoming_model_gpu = {k: v.to(device) for k, v in entry["model_state_dict"].items()}
             incoming_momentum_gpu = [m.to(device) for m in entry["momentum_vector"]]
-            for key in sum_state_dict:
-                if key in incoming_model_gpu:
-                    sum_state_dict[key].add_(incoming_model_gpu[key])
-            for i in range(len(sum_momentum_vector)):
-                sum_momentum_vector[i].add_(incoming_momentum_gpu[i])
-            model_count += 1
+
+            should_integrate = True
+            if enable_validation and validator is not None and validation_loader is not None:
+                validation_result = validator.validate(
+                    peer_model=model,
+                    incoming_state_dict=incoming_model_gpu,
+                    device=device,
+                    validation_loader=validation_loader,
+                    peer_id=peer_id,
+                    source_peer_id=source_peer
+                )
+                should_integrate = validation_result['valid']
+                print(validation_result['decision_reason'], flush=True)
+
+                 # Record in ledger
+                if ledger is not None:
+                    if should_integrate:
+                        ledger.add_integration(iteration, source_peer, validation_result)
+                    else:
+                        ledger.add_rejection(iteration, source_peer, validation_result)
+            
+            if should_integrate:
+                for key in integrated_state_dict:
+                    if key in incoming_model_gpu:
+                        integrated_state_dict[key].add_(incoming_model_gpu[key])
+                for i in range(len(integrated_momentum)):
+                    integrated_momentum[i].add_(incoming_momentum_gpu[i])
+                integrated_count += 1
+                accepted_peers.append(source_peer)
+            else:
+                rejected_peers.append(source_peer)
+
             del incoming_model_gpu, incoming_momentum_gpu
+            
         except KeyError:
             print(f"[{datetime.now()}] WARNING: Peer {peer_id} could not load model/momentum from peer {peer}.")
 
-    # 3v5: finalize the average
-    if model_count > 0:
-        for key in sum_state_dict:
-            sum_state_dict[key].div_(model_count)
-        for i in range(len(sum_momentum_vector)):
-            sum_momentum_vector[i].div_(model_count)
+    # 3v5: Average only the integrated models
+    if integrated_count > 0:
+        for key in integrated_state_dict:
+            integrated_state_dict[key].div_(integrated_count)
+        for i in range(len(integrated_momentum)):
+            integrated_momentum[i].div_(integrated_count)
+
+    # Log integration statistics
+    print(f"[Peer {peer_id}] Integrated {integrated_count}/{len(written_members)} models. "
+          f"Accepted: {accepted_peers}, Rejected: {rejected_peers}", flush=True)
     
     # 4v5: track communication traffic
-    communicated_bytes += (sum(p.numel() * p.element_size() for p in sum_state_dict.values()) + sum(m.numel() * m.element_size() for m in sum_momentum_vector)) * (model_count -1)
+    communicated_bytes += (sum(p.numel() * p.element_size() for p in integrated_state_dict.values()) + 
+                           sum(m.numel() * m.element_size() for m in integrated_momentum)) * (integrated_count -1)
 
     # 5v5: cleanup if we are the coordinator
     barrier_key_cleanup = f"cm2_{iter_key}"
@@ -652,11 +502,11 @@ def communicate_models(testing, device, peer_id, num_peers, num_participating_pe
                 pass
         torch.cuda.empty_cache()
         gc.collect()        
-    return sum_state_dict, sum_momentum_vector, len(written_members), communicated_bytes
+    return integrated_state_dict, integrated_momentum, len(written_members), communicated_bytes
 
 
 def peer_process(seed, split_type, dirichlet_alpha, ml_task, peer_id, bootstrap_address, task_queue, result_queue, num_peers, peers_per_core, learning_rate, momentum, shared_model_dict, valid_cores, device, model, momentum_vector=None, next_batch_idx=None
-                 , enable_validation=False, accuracy_threshold=0.2):
+                 , enable_validation=False, accuracy_threshold=0.2, loss_threshold=0.2):
     try:
         """ Each peer runs persistently and waits for tasks to execute """
 
@@ -700,14 +550,16 @@ def peer_process(seed, split_type, dirichlet_alpha, ml_task, peer_id, bootstrap_
                 train_loader, validation_loader, test_loader = get_mnist_data_loaders(partition=peer_id, num_partitions=num_peers, seed=seed)
 
         # Added things for ModelChain validation
+        validator, ledger = None, None
         if enable_validation:
             validator, ledger = create_validation_components(
                 peer_id=peer_id,
-                accuracy_threshold=accuracy_threshold
+                accuracy_threshold=accuracy_threshold,
+                loss_threshold=loss_threshold
             )
             print(f"[Peer {peer_id}] ModelChain validation ENABLED", flush=True)
         else:
-            validator, ledger = None, None
+            print(f"[Peer {peer_id}] ModelChain validation DISABLED", flush=True)
         
         num_batches = len(train_loader)
         if momentum_vector is None:
@@ -777,12 +629,11 @@ def peer_process(seed, split_type, dirichlet_alpha, ml_task, peer_id, bootstrap_
                     # Communication and federated averaging
                     communicated_bytes = 0
                     kl_factor = 0
-                    include_ce_loss = True
                     round = 1
                     group_lengths = []
-                    result_1_model, result_1_momentum, group_length, communicated_bytes = communicate_models(TESTING, device, peer_id, num_peers, num_participating_peers, model, momentum_vector, 
+                    result_1_model, result_1_momentum, integrated_count, communicated_bytes = communicate_models(TESTING, device, peer_id, num_peers, num_participating_peers, model, momentum_vector, 
                                                                                                              shared_model_dict, dht, iteration, round, communicated_bytes, validation_loader=validation_loader, validator=validator, ledger=ledger, enable_validation=enable_validation)
-                    group_lengths.append(group_length)
+                    group_lengths.append(integrated_count)
                     if result_1_model:
                         # Aggregate collected models and momentum vectors
                         if isinstance(model, ModernBERTClassifier):
@@ -798,10 +649,18 @@ def peer_process(seed, split_type, dirichlet_alpha, ml_task, peer_id, bootstrap_
                     del result_1_model, result_1_momentum
                     torch.cuda.empty_cache()
                     gc.collect()
+
+                    avg_group_length = sum(group_lengths) / len(group_lengths) if group_lengths else 0
+                    aggregation_duration = time.time() - start_time_aggregation
+                    
+                    if ledger is not None and iteration % 10 == 0:
+                        stats = ledger.get_statistics()
+                        print(f"[Peer {peer_id}] Ledger Stats: {stats}", flush=True)
                     
                     # If testing iteration then evaluate the model in a subprocess
                     avg_group_length = sum(group_lengths) / len(group_lengths) if group_lengths else 0
                     aggregation_duration = time.time() - start_time_aggregation
+
                     if do_testing:
                         start_time_testing = time.time()    
                         test_acc, test_loss = evaluate(model, device, test_loader, label="Peer Test", peer_id=peer_id)
@@ -812,7 +671,7 @@ def peer_process(seed, split_type, dirichlet_alpha, ml_task, peer_id, bootstrap_
                     else:
                         result_queue.put((4, iteration, peer_id, 0, 0, (avg_group_length, communicated_bytes, kl_factor, learning_rate, aggregation_duration, 0)))
 
-
+                    
                 # Avoid peers to crash during rare participation windows
                 elif task == "skip":
                     print(f"Peer {peer_id} skipping iteration {iteration}...")
@@ -1318,7 +1177,12 @@ def main():
                 shared_model_dict,
                 valid_cores,
                 wandb.config.device,
-                copy.deepcopy(model)
+                copy.deepcopy(model),
+                None,
+                None,
+                wandb.config.enable_validation,
+                wandb.config.accuracy_threshold,
+                wandb.config.loss_threshold,
             ))
 
             for i in range(wandb.config.num_peers)
@@ -1463,6 +1327,9 @@ if __name__ == "__main__":
     parser.add_argument("--rt", type=int, default=12, help="Maximum allowed runtime in hours")
     parser.add_argument("--sp", type=str, default="iid", choices=["iid","dirichlet"], help="How to split training data across peers")
     parser.add_argument("--al", type=float, default=1.0, help="Dirichlet alpha for non-IID when --sp=dirichlet")
+    parser.add_argument("--ev", type=int, default=1, help="Enable validation (1=enabled, 0=disabled for standard FedAvg)")
+    parser.add_argument("--at", type=float, default=0.0, help="Accuracy threshold for accepting updates (percentage points)")
+    parser.add_argument("--lt", type=float, default=0.0, help="Loss threshold for accepting updates")
     args = parser.parse_args()
 
     # Set random seeds for reproducibility
@@ -1479,6 +1346,10 @@ if __name__ == "__main__":
     PEER_DROPOUT_LIKELIHOOD = args.dl
     ITERATIONS_MECHANISM_VALUE = args.iv
     max_runtime = args.rt
+    ENABLE_VALIDATION = bool(args.ev)
+    ACCURACY_THRESHOLD = args.at
+    LOSS_THRESHOLD = args.lt
+
     if ML_TASK == "news":
         if args.sp == "dirichlet":
             mock_train_loader, _, _ = get_text_data_loaders_dirichlet(partition=0, num_partitions=NUM_PEERS, seed=seed, alpha=args.al)
@@ -1534,7 +1405,10 @@ if __name__ == "__main__":
             'dispatcher_patience': DISPATCHER_PATIENCE,
             'max_runtime': max_runtime,
             'split_type': args.sp,
-            'dirichlet_alpha': args.al
+            'dirichlet_alpha': args.al,
+            'enable_validation': ENABLE_VALIDATION,
+            'accuracy_threshold': ACCURACY_THRESHOLD,
+            'loss_threshold': LOSS_THRESHOLD,
         },
     )
 
