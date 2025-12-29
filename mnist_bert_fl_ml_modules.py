@@ -270,8 +270,8 @@ def get_mnist_data_loaders(partition, num_partitions, seed=42, batch_size=64, va
     total_size = len(dataset)
     partition_size = total_size // num_partitions
     start_idx = partition * partition_size
-    valid_idx = (partition + 1) * partition_size * validation_split if partition != num_partitions - 1 else total_size * (1 - validation_split)
-    end_idx = (partition + 1) * partition_size if partition != num_partitions - 1 else total_size
+    valid_idx = int((partition + 1) * partition_size * validation_split) if partition != num_partitions - 1 else total_size * (1 - validation_split)
+    end_idx = int((partition + 1) * partition_size) if partition != num_partitions - 1 else total_size
     partition_indices = list(range(valid_idx, end_idx))
     valid_dataset = Subset(dataset, list(range(start_idx, valid_idx)))
     train_dataset = Subset(dataset, partition_indices)

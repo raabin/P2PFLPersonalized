@@ -41,13 +41,13 @@ KD_NUM_DATASET_SIGHTINGS = 10                                               # NO
 
 TESTING = False
 
-ENTITY = "P2PFLPersonalized"
+ENTITY = "rabin-missouri-s-t"
 PROJECT = "p2p_fl"
 
 DEVICE = "cuda"                                                             # NOTE "cpu" or "cuda"
 ADMIN = False                                                               # NOTE admin permissions (e.g., to kill zombie processes)
 
-NUM_PEERS = 64
+NUM_PEERS = 24
 PEERS_PER_CORE = 1                                                          # NOTE set peers_per_core=2 when num_peers=64 while --ntasks=1 & --cpus-per-task=32
 
 LOCAL_UPDATE_PARTICIPATION_PROB = 100
@@ -204,8 +204,6 @@ class UtilityValidator:
             return f"[Peer {peer_id}] ACCEPT from Peer {source_peer_id}: Accuracy {improvement['accuracy_delta']:+.2f}%, Loss {improvement['loss_delta']:+.4f}"
         else:
             return f"[Peer {peer_id}] REJECT from Peer {source_peer_id}: Accuracy {improvement['accuracy_delta']:+.2f}% (threshold: {self.accuracy_threshold}%)"
-
-
 
 # ==================== MODEL LEDGER ====================
 
@@ -755,7 +753,8 @@ def fedavg_aggregation(model, models_collected, momentum_vector, momentum_vector
 
 def dispatcher(max_runtime, ml_task, peer_processes, task_queue, result_queue, device, num_peers, 
                local_update_participation_prob, aggregation_participation_prob, peer_dropout_likelihood, max_iterations, 
-               mini_batches_per_iteration, testing_frequency, convergence_threshold, convergence_patience, dispatcher_patience):
+               mini_batches_per_iteration, testing_frequency, convergence_threshold, convergence_patience, dispatcher_patience,
+               learning_rate, momentum):
     """ Central controller dispatching tasks dynamically """
     
     print("Dispatcher assigning tasks...")
@@ -1123,7 +1122,7 @@ def main():
     """ Spawns NUM_PEERS processes running as persistent peers """
 
     # Shared memory check before any multiprocessing
-    print("[SHM-CHECK][BEFORE MP] /dev/shm usage before starting Manager/processes:")
+    print("[SHM-CHECKdispatcher][BEFORE MP] /dev/shm usage before starting Manager/processes:")
     shm_before_mp_MB = _dev_shm_usage_bytes() / 1024 / 1024
     shm_before_mp_total_MB = _dev_shm_total_usage_bytes() / 1024 / 1024
     print(f"    /dev/shm (psm_, torch_): ≈ {shm_before_mp_MB:.1f} MB")
@@ -1197,15 +1196,11 @@ def main():
             dispatcher(
                 max_runtime=wandb.config.max_runtime,
                 ml_task=ml_task,
-                shared_model_dict=shared_model_dict,
                 peer_processes=peer_processes, 
                 task_queue=task_queue, 
-                result_queue=result_queue, 
-                bootstrap_dht=bootstrap_dht,
-                valid_cores=valid_cores,
+                result_queue=result_queue,
                 device=wandb.config.device,
-                num_peers=wandb.config.num_peers, 
-                peers_per_core=wandb.config.peers_per_core, 
+                num_peers=wandb.config.num_peers,
                 local_update_participation_prob=wandb.config.local_update_participation_prob,
                 aggregation_participation_prob=wandb.config.aggregation_participation_prob,
                 peer_dropout_likelihood=wandb.config.peer_dropout_likelihood,
@@ -1313,6 +1308,7 @@ if __name__ == "__main__":
     if ADMIN:
         [os.kill(int(ppid), 9) for ppid in set(subprocess.getoutput("ps -eo ppid,state | awk '$2==\"Z\" {print $1}'").split()) if ppid.isdigit() and int(ppid) > 1]
 
+    os.environ['WANDB_API_KEY'] = 'f0246e9a77b6898f7f13929f4c1f3ad2e18cda8a'
     # Argument parsing
     parser = argparse.ArgumentParser(description="AR Peer-to-Peer Federated Learning")
     parser.add_argument("--sd", type=int, default=42, help="Seed for random value generation")
@@ -1363,7 +1359,7 @@ if __name__ == "__main__":
     TOTAL_BATCHES = len(mock_train_loader)
 
     # Different project name if non-IID data
-    PROJECT = "p2p_fl_niid"
+    PROJECT = "p2p_fl"
 
     # Modify some hyperparameters when doing BERT
     if ML_TASK == "news":
