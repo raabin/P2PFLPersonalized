@@ -397,7 +397,7 @@ def count_num_participating_peers(peer_id, iteration, num_peers, dht, wait_time=
 
 # Communicate model parameters and momentum vectors within groups through writing to and reading from shared group dicts
 def communicate_models(testing, device, peer_id, num_peers, num_participating_peers, model, momentum_vector, shared_model_dict, dht, iteration, round, communicated_bytes,
-                       validation_loader=None, validator=None, ledger=None, enable_validation=False):
+                       validation_loader=None, validator=None, ledger=None, enable_validation=True):
     
     # Prepare data to be communicated
     iter_key = f"{iteration}-{round}"
@@ -504,7 +504,7 @@ def communicate_models(testing, device, peer_id, num_peers, num_participating_pe
 
 
 def peer_process(seed, split_type, dirichlet_alpha, ml_task, peer_id, bootstrap_address, task_queue, result_queue, num_peers, peers_per_core, learning_rate, momentum, shared_model_dict, valid_cores, device, model, momentum_vector=None, next_batch_idx=None
-                 , enable_validation=False, accuracy_threshold=0.2, loss_threshold=0.2):
+                 , enable_validation=True, accuracy_threshold=0.2, loss_threshold=0.2):
     try:
         """ Each peer runs persistently and waits for tasks to execute """
 
